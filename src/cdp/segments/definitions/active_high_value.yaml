@@ -1,0 +1,5 @@
+name: active_high_value
+type: rule
+where: >
+  L30D_purchases >= 2 AND clv_simple >= 150
+description: High-value users with 2+ purchases in last 30 days.
