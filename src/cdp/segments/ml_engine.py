@@ -1,26 +1,70 @@
-import os, duckdb, joblib, pandas as pd
-from ..utils.storage import get_connection
+# src/cdp/segments/ml_engine.py
+import json, joblib, numpy as np, pandas as pd
+from pathlib import Path
+from src.cdp.db import get_con
 
-ARTIFACT = "data/artifacts/propensity_30d.joblib"
-THRESHOLD = 0.6
+# ---- Canonical artifact paths (shared with trainer) ----
+ROOT = Path(__file__).resolve().parents[3]  # adjust if your package depth differs
+ART_DIR = ROOT / "artifacts"
+MODEL_PATH = ART_DIR / "model.pkl"
+FEATS_PATH = ART_DIR / "feature_list.json"
 
-def score_segment(spec: dict, limit=100, offset=0):
-    if not os.path.exists(ARTIFACT):
-        return {"error": "model artifact not found. Run: python -m src.cdp.cli train-propensity"}
-    model = joblib.load(ARTIFACT)
-    con = get_connection()
-    feats = con.execute("""
-        SELECT user_id, L30D_events, L30D_sessions, L30D_add_to_cart, L30D_purchases, clv_simple
+print("Loading model from:", MODEL_PATH)
+print("Loading feature list from:", FEATS_PATH)
+
+def _align_for_inference(df: pd.DataFrame, feature_list: list[str]) -> pd.DataFrame:
+    # strip any accidental label columns
+    for lbl in ("y", "label", "target"):
+        if lbl in df.columns:
+            df = df.drop(columns=[lbl])
+    # order + fill
+    X = df.reindex(columns=feature_list, fill_value=0)
+    X = X.replace([np.inf, -np.inf], 0).fillna(0)
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0).astype(float)
+    return X
+
+def _load_artifacts():
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Missing model at {MODEL_PATH}")
+    if not FEATS_PATH.exists():
+        raise FileNotFoundError(f"Missing feature list at {FEATS_PATH}")
+    model = joblib.load(MODEL_PATH)
+    feature_list = json.loads(FEATS_PATH.read_text())
+    return model, feature_list
+
+def score_segment(spec: str, limit: int = 25, offset: int = 0):
+    con = get_con()
+
+    # ✅ Use your real table
+    df = con.sql(f"""
+        SELECT *
         FROM features_daily
-        ORDER BY user_id
-        LIMIT ? OFFSET ?
-    """, [limit, offset]).fetchdf()
-    if feats.empty:
-        return {"name": spec.get("name","likely_to_buy_30d"), "type": "ml", "items": []}
-    X = feats.drop(columns=["user_id"]).fillna(0.0)
-    probs = model.predict_proba(X)[:,1]
-    feats["score"] = probs
-    feats["in_segment"] = feats["score"] >= spec.get("threshold", THRESHOLD)
-    items = feats[feats["in_segment"]]["user_id"].tolist()
-    return {"name": "likely_to_buy_30d", "type": "ml", "threshold": spec.get("threshold", THRESHOLD),
-            "count": len(items), "items": items[:limit]}
+        LIMIT {int(limit)} OFFSET {int(offset)}
+    """).df()
+
+    if df.empty:
+        return []
+
+    # keep IDs before aligning
+    user_id_col = "user_id" if "user_id" in df.columns else None
+    user_ids = df[user_id_col].astype(str).tolist() if user_id_col else [None] * len(df)
+
+    model, feature_list = _load_artifacts()
+
+    # align features to training schema
+    feat_df = df.drop(columns=[user_id_col]) if user_id_col else df
+    X = _align_for_inference(feat_df, feature_list)
+    if X.empty:
+        return [{"user_id": uid, "probability": None} for uid in user_ids]
+
+    # predict
+    if hasattr(model, "predict_proba"):
+        probs = model.predict_proba(X)[:, 1]
+    elif hasattr(model, "decision_function"):
+        scores = model.decision_function(X)
+        probs = 1 / (1 + np.exp(-scores))
+    else:
+        probs = model.predict(X).astype(float)
+
+    return [{"user_id": user_ids[i], "probability": float(probs[i])} for i in range(len(user_ids))]

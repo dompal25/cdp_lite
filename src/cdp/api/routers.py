@@ -2,7 +2,7 @@ from fastapi import APIRouter, Query
 from ..segments.registry import SEGMENTS
 from ..segments.rules_engine import query_rule_segment
 from ..segments.ml_engine import score_segment
-from ..utils.storage import get_connection
+from src.cdp.db import get_con
 
 router = APIRouter()
 
