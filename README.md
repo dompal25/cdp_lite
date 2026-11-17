@@ -31,7 +31,7 @@ curl 'http://127.0.0.1:8000/v1/segments/likely_to_buy_30d?limit=25'
 
 ## Project Structure
 ```
-cdp-sandbox/
+cdp_lite/
 ├─ src/cdp/
 │  ├─ api/ (FastAPI)
 │  ├─ ingest/ (schemas, writer)
